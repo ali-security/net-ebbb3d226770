@@ -456,6 +456,17 @@ func TestParseFragmentWithNilContext(t *testing.T) {
 	ParseFragment(strings.NewReader("<p>hello</p>"), nil)
 }
 
+func TestParseFragmentForeignContentTemplates(t *testing.T) {
+	srcs := []string{
+		"<math><html><template><mn><template></template></template>",
+		"<math><math><head><mi><template>",
+	}
+	for _, src := range srcs {
+		// The next line shouldn't infinite-loop.
+		ParseFragment(strings.NewReader(src), nil)
+	}
+}
+
 func BenchmarkParser(b *testing.B) {
 	buf, err := ioutil.ReadFile("testdata/go1.html")
 	if err != nil {

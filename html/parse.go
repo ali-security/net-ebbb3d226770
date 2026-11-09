@@ -487,6 +487,20 @@ func (p *parser) resetInsertionMode() {
 			n = p.context
 		}
 
+		// Only HTML elements select an insertion mode: the HTML5 "reset the
+		// insertion mode appropriately" algorithm names HTML elements only, so
+		// a foreign (MathML/SVG) element that happens to be called e.g. "html"
+		// or "body" must not match. Matching it here could pick afterHeadIM
+		// while the current node is foreign, and the implied <body> it then
+		// inserts never consumes the token: an infinite loop (CVE-2021-33194).
+		if n.Namespace != "" {
+			if last {
+				p.im = inBodyIM
+				return
+			}
+			continue
+		}
+
 		switch n.DataAtom {
 		case a.Select:
 			if !last {
