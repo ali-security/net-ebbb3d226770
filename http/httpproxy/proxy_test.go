@@ -178,6 +178,13 @@ var proxyForURLTests = []proxyForURLTest{{
 	},
 	req:  "http://example.com/",
 	want: "http://proxy",
+}, {
+	cfg: httpproxy.Config{
+		NoProxy:   "example.com",
+		HTTPProxy: "proxy",
+	},
+	req:  "http://[1000::%25.example.com]:123",
+	want: "http://proxy",
 }}
 
 func testProxyForURL(t *testing.T, tt proxyForURLTest) {

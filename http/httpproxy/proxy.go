@@ -181,7 +181,7 @@ func (cfg *config) useProxy(addr string) bool {
 	if host == "localhost" {
 		return false
 	}
-	ip := net.ParseIP(host)
+	ip := hostIP(host)
 	if ip != nil {
 		if ip.IsLoopback() {
 			return false
@@ -360,7 +360,23 @@ type domainMatch struct {
 	matchHost bool
 }
 
+// hostIP parses host as an IP address, accepting an optional IPv6 zone
+// identifier (e.g. "fe80::1%en0" or "1000::%25.example.com"). net.ParseIP
+// rejects zones, which let a crafted zone shaped like a domain suffix
+// (CVE-2025-22870) slip past IP detection and be matched as a host name.
+// net/netip.ParseAddr would handle zones directly but requires Go 1.18; this
+// module targets Go 1.11, so strip the zone before net.ParseIP.
+func hostIP(host string) net.IP {
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host = host[:i]
+	}
+	return net.ParseIP(host)
+}
+
 func (m domainMatch) match(host, port string, ip net.IP) bool {
+	if ip != nil {
+		return false
+	}
 	if strings.HasSuffix(host, m.host) || (m.matchHost && host == m.host[1:]) {
 		return m.port == "" || m.port == port
 	}

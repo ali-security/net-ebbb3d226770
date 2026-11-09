@@ -74,3 +74,15 @@ func TestPerHost(t *testing.T) {
 		}
 	})
 }
+
+// TestPerHostZoneID checks that an IPv6 host carrying a zone identifier that
+// looks like a domain is matched as an IP, not a host name (CVE-2025-22870).
+func TestPerHostZoneID(t *testing.T) {
+	var def, bypass recordingProxy
+	perHost := NewPerHost(&def, &bypass)
+	perHost.AddFromString("1000::/16")
+	perHost.Dial("tcp", "[1000::%25.example.com]:123")
+	if len(bypass.addrs) != 1 || len(def.addrs) != 0 {
+		t.Errorf("zone-id host: bypass=%v default=%v, want it matched by the IP network", bypass.addrs, def.addrs)
+	}
+}

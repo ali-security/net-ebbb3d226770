@@ -57,7 +57,7 @@ func (p *PerHost) DialContext(ctx context.Context, network, addr string) (c net.
 }
 
 func (p *PerHost) dialerForRequest(host string) Dialer {
-	if ip := net.ParseIP(host); ip != nil {
+	if ip := hostIP(host); ip != nil {
 		for _, net := range p.bypassNetworks {
 			if net.Contains(ip) {
 				return p.bypass
@@ -108,7 +108,7 @@ func (p *PerHost) AddFromString(s string) {
 			}
 			continue
 		}
-		if ip := net.ParseIP(host); ip != nil {
+		if ip := hostIP(host); ip != nil {
 			p.AddIP(ip)
 			continue
 		}
@@ -152,4 +152,15 @@ func (p *PerHost) AddHost(host string) {
 		host = host[:len(host)-1]
 	}
 	p.bypassHosts = append(p.bypassHosts, host)
+}
+
+// hostIP parses host as an IP address, accepting an optional IPv6 zone
+// identifier. net.ParseIP rejects zones, which let a crafted zone shaped
+// like a domain slip past IP detection (CVE-2025-22870). net/netip would
+// handle zones directly but requires Go 1.18; this module targets Go 1.11.
+func hostIP(host string) net.IP {
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host = host[:i]
+	}
+	return net.ParseIP(host)
 }
