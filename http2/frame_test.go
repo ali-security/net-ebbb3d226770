@@ -910,6 +910,15 @@ func TestMetaFrameHeader(t *testing.T) {
 
 	oneKBString := strings.Repeat("a", 1<<10)
 
+	// A Trailer declaration of 20 fields: ~250 bytes on the wire, but ~900
+	// bytes by our accounting since we add 32 bytes for each entry in
+	// Request.Trailer.
+	var trailerNames []string
+	for i := 0; i < 20; i++ {
+		trailerNames = append(trailerNames, fmt.Sprintf("x-trailer-%d", i))
+	}
+	trailerDecl := strings.Join(trailerNames, ",")
+
 	tests := [...]struct {
 		name              string
 		w                 func(*Framer)
@@ -1079,6 +1088,29 @@ func TestMetaFrameHeader(t *testing.T) {
 			},
 			maxHeaderListSize: (1 << 10) / 2,
 			want:              ConnectionError(ErrCodeProtocol),
+		},
+		15: {
+			name: "trailer_declaration_okay",
+			w: func(f *Framer) {
+				write(f, encodeHeaderRaw(t, ":method", "GET", ":path", "/", "trailer", trailerDecl))
+			},
+			maxHeaderListSize: 1024,
+			want: want(FlagHeadersEndHeaders, 193,
+				":method", "GET",
+				":path", "/",
+				"trailer", trailerDecl,
+			),
+		},
+		16: {
+			name: "trailer_declaration_truncated",
+			w: func(f *Framer) {
+				write(f, encodeHeaderRaw(t, ":method", "GET", ":path", "/", "trailer", trailerDecl))
+			},
+			maxHeaderListSize: 512,
+			want: truncated(want(FlagHeadersEndHeaders, 193,
+				":method", "GET",
+				":path", "/",
+			)),
 		},
 	}
 	for i, tt := range tests {
