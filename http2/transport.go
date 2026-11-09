@@ -2345,6 +2345,9 @@ func (rl *clientConnReadLoop) processSettings(f *SettingsFrame) error {
 	}
 
 	err := f.ForeachSetting(func(s Setting) error {
+		if err := s.Valid(); err != nil {
+			return err
+		}
 		switch s.ID {
 		case SettingMaxFrameSize:
 			cc.maxFrameSize = s.Val
