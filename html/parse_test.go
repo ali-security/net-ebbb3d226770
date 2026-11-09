@@ -467,3 +467,10 @@ func BenchmarkParser(b *testing.B) {
 		Parse(bytes.NewBuffer(buf))
 	}
 }
+
+func TestIssue70179(t *testing.T) {
+	_, err := Parse(strings.NewReader("<table><tbody><svg><td><desc><select></select></tbody>"))
+	if err != nil {
+		t.Fatalf("unexpected failure: %v", err)
+	}
+}
