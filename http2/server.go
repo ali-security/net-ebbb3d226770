@@ -576,7 +576,8 @@ type stream struct {
 	// immutable:
 	sc        *serverConn
 	id        uint32
-	body      *pipe       // non-nil if expecting DATA frames
+	body      *pipe // non-nil if expecting DATA frames
+	reqBody   *requestBody
 	cw        closeWaiter // closed wait stream transitions to closed state
 	ctx       context.Context
 	cancelCtx func()
@@ -1563,10 +1564,6 @@ func (sc *serverConn) closeStream(st *stream, err error) {
 		}
 	}
 	if p := st.body; p != nil {
-		// Return any buffered unread bytes worth of conn-level flow control.
-		// See golang.org/issue/16481
-		sc.sendWindowUpdate(nil, p.Len())
-
 		p.CloseWithError(err)
 	}
 	st.cw.Close() // signals Handler's CloseNotifier, unblocks writes, etc
@@ -1722,15 +1719,18 @@ func (sc *serverConn) processData(f *DataFrame) error {
 		st.inflow.take(int32(f.Length))
 
 		if len(data) > 0 {
+			st.bodyBytes += int64(len(data))
 			wrote, err := st.body.Write(data)
 			if err != nil {
+				// The handler has closed the request body.
+				// Return the connection-level flow control for the discarded data,
+				// but not the stream-level flow control.
 				sc.sendWindowUpdate(nil, int(f.Length)-wrote)
-				return streamError(id, ErrCodeStreamClosed)
+				return nil
 			}
 			if wrote != len(data) {
 				panic("internal error: bad Writer")
 			}
-			st.bodyBytes += int64(len(data))
 		}
 
 		// Return any padded flow control now, since we won't
@@ -1887,7 +1887,7 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
 	if st.reqTrailer != nil {
 		st.trailer = make(http.Header)
 	}
-	st.body = req.Body.(*requestBody).pipe // may be nil
+	st.body = st.reqBody.pipe // may be nil
 	st.declBodyBytes = req.ContentLength
 
 	handler := sc.handler.ServeHTTP
@@ -1909,7 +1909,7 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
 		sc.conn.SetReadDeadline(time.Time{})
 	}
 
-	return sc.scheduleHandler(id, rw, req, handler)
+	return sc.scheduleHandler(st, rw, req, handler)
 }
 
 func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
@@ -2057,7 +2057,7 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		} else {
 			req.ContentLength = -1
 		}
-		req.Body.(*requestBody).pipe = &pipe{
+		st.reqBody.pipe = &pipe{
 			b: &dataBuffer{expected: req.ContentLength},
 		}
 	}
@@ -2120,7 +2120,7 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp requestParam) (*r
 		requestURI = rp.path
 	}
 
-	body := &requestBody{
+	st.reqBody = &requestBody{
 		conn:          sc,
 		stream:        st,
 		needsContinue: needsContinue,
@@ -2136,7 +2136,7 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp requestParam) (*r
 		ProtoMinor: 0,
 		TLS:        tlsState,
 		Host:       rp.authority,
-		Body:       body,
+		Body:       st.reqBody,
 		Trailer:    trailer,
 	}
 	req = req.WithContext(st.ctx)
@@ -2149,7 +2149,7 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp requestParam) (*r
 	rws.bw.Reset(chunkWriter{rws})
 	rws.stream = st
 	rws.req = req
-	rws.body = body
+	rws.body = st.reqBody
 
 	rw := &responseWriter{rws: rws}
 	return rw, req, nil
@@ -2160,11 +2160,12 @@ type unstartedHandler struct {
 	rw       *responseWriter
 	req      *http.Request
 	handler  func(http.ResponseWriter, *http.Request)
+	body     *pipe
 }
 
 // scheduleHandler starts a handler goroutine,
 // or schedules one to start as soon as an existing handler finishes.
-func (sc *serverConn) scheduleHandler(streamID uint32, rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) error {
+func (sc *serverConn) scheduleHandler(st *stream, rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) error {
 	sc.serveG.check()
 	maxHandlers := sc.advMaxStreams
 	if sc.curHandlers < maxHandlers {
@@ -2176,10 +2177,11 @@ func (sc *serverConn) scheduleHandler(streamID uint32, rw *responseWriter, req *
 		return ConnectionError(ErrCodeEnhanceYourCalm)
 	}
 	sc.unstartedHandlers = append(sc.unstartedHandlers, unstartedHandler{
-		streamID: streamID,
+		streamID: st.id,
 		rw:       rw,
 		req:      req,
 		handler:  handler,
+		body:     st.body,
 	})
 	return nil
 }
@@ -2193,6 +2195,10 @@ func (sc *serverConn) handlerDone() {
 		u := sc.unstartedHandlers[i]
 		if sc.streams[u.streamID] == nil {
 			// This stream was reset before its goroutine had a chance to start.
+			if u.body != nil {
+				u.body.BreakWithError(errClosedBody)
+				sc.sendWindowUpdate(nil, u.body.Len())
+			}
 			continue
 		}
 		if sc.curHandlers >= maxHandlers {
@@ -2214,6 +2220,10 @@ func (sc *serverConn) runHandler(rw *responseWriter, req *http.Request, handler 
 	didPanic := true
 	defer func() {
 		rw.rws.stream.cancelCtx()
+		if b := rw.rws.stream.reqBody; b != nil {
+			// Closing the body refunds flow control credit for any unconsumed data.
+			b.Close()
+		}
 		if didPanic {
 			e := recover()
 			sc.writeFrameFromHandler(FrameWriteRequest{
@@ -2309,7 +2319,7 @@ func (sc *serverConn) noteBodyReadFromHandler(st *stream, n int, err error) {
 func (sc *serverConn) noteBodyRead(st *stream, n int) {
 	sc.serveG.check()
 	sc.sendWindowUpdate(nil, n) // conn-level
-	if st.state != stateHalfClosedRemote && st.state != stateClosed {
+	if st != nil && st.state != stateHalfClosedRemote && st.state != stateClosed {
 		// Don't send this WINDOW_UPDATE if the stream is closed
 		// remotely.
 		sc.sendWindowUpdate(st, n)
@@ -2366,17 +2376,21 @@ type requestBody struct {
 	_             incomparable
 	stream        *stream
 	conn          *serverConn
-	closed        bool  // for use by Close only
-	sawEOF        bool  // for use by Read only
-	pipe          *pipe // non-nil if we have a HTTP entity message body
-	needsContinue bool  // need to send a 100-continue
+	closeOnce     sync.Once // for use by Close only
+	sawEOF        bool      // for use by Read only
+	pipe          *pipe     // non-nil if we have a HTTP entity message body
+	needsContinue bool      // need to send a 100-continue
 }
 
 func (b *requestBody) Close() error {
-	if b.pipe != nil && !b.closed {
-		b.pipe.BreakWithError(errClosedBody)
-	}
-	b.closed = true
+	b.closeOnce.Do(func() {
+		if b.pipe != nil {
+			b.pipe.BreakWithError(errClosedBody)
+			if unread := b.pipe.Len(); unread > 0 {
+				b.conn.noteBodyReadFromHandler(nil, unread, errClosedBody)
+			}
+		}
+	})
 	return nil
 }
 

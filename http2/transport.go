@@ -2333,8 +2333,21 @@ func (rl *clientConnReadLoop) processData(f *DataFrame) error {
 
 		if len(data) > 0 && !didReset {
 			if _, err := cs.bufPipe.Write(data); err != nil {
-				rl.endStreamError(cs, err)
-				return err
+				if cs.bufPipe.Err() != errClosedResponseBody {
+					rl.endStreamError(cs, err)
+					return err
+				}
+				// The response body was closed concurrently with this
+				// DATA frame. Discard the data, but return its
+				// connection-level flow control.
+				cc.mu.Lock()
+				cc.inflow.add(int32(len(data)))
+				cc.mu.Unlock()
+
+				cc.wmu.Lock()
+				cc.fr.WriteWindowUpdate(0, uint32(len(data)))
+				cc.bw.Flush()
+				cc.wmu.Unlock()
 			}
 		}
 	}

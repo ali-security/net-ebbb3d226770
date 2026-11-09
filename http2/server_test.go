@@ -588,6 +588,97 @@ func (st *serverTester) wantWindowUpdate(streamID, incr uint32) {
 	}
 }
 
+// wantConnWindowUpdates reads connection-level WINDOW_UPDATE frames
+// until their increments add up to total.
+func (st *serverTester) wantConnWindowUpdates(total uint32) {
+	var got uint32
+	for got < total {
+		f, err := st.readFrame()
+		if err != nil {
+			st.t.Fatalf("Error while expecting a WINDOW_UPDATE frame: %v", err)
+		}
+		wu, ok := f.(*WindowUpdateFrame)
+		if !ok || wu.FrameHeader.StreamID != 0 {
+			st.t.Fatalf("got %v; want connection-level WINDOW_UPDATE", summarizeFrame(f))
+		}
+		got += wu.Increment
+	}
+	if got != total {
+		st.t.Fatalf("WindowUpdate increments = %d; want %d", got, total)
+	}
+}
+
+// wantUnorderedFrames reads len(preds) frames, in any order, and fails
+// the test unless each frame matches one of the predicates.
+func (st *serverTester) wantUnorderedFrames(preds ...func(Frame) bool) {
+	remaining := append([]func(Frame) bool(nil), preds...)
+	for len(remaining) > 0 {
+		f, err := st.readFrame()
+		if err != nil {
+			st.t.Fatalf("Error while expecting %d more frames: %v", len(remaining), err)
+		}
+		matched := false
+		for i, pred := range remaining {
+			if pred(f) {
+				remaining = append(remaining[:i], remaining[i+1:]...)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			st.t.Fatalf("got unexpected frame %v", summarizeFrame(f))
+		}
+	}
+}
+
+func (st *serverTester) writeRSTStream(streamID uint32, code ErrCode) {
+	if err := st.fr.WriteRSTStream(streamID, code); err != nil {
+		st.t.Fatalf("Error writing RST_STREAM: %v", err)
+	}
+}
+
+// sync waits for the server to process every frame written by the client
+// so far, by writing a PING and waiting for its ACK. It fails the test if
+// the server writes any other frame before the ACK.
+func (st *serverTester) sync() {
+	data := [8]byte{'s', 'y', 'n', 'c', 'p', 'i', 'n', 'g'}
+	if err := st.fr.WritePing(false, data); err != nil {
+		st.t.Fatalf("Error writing PING: %v", err)
+	}
+	f, err := st.readFrame()
+	if err != nil {
+		st.t.Fatalf("Error while expecting a PING ACK: %v", err)
+	}
+	if pf, ok := f.(*PingFrame); !ok || !pf.IsAck() || pf.Data != data {
+		st.t.Fatalf("got %v; want PING ACK", summarizeFrame(f))
+	}
+}
+
+// awaitHandlersDone waits until the server conn has no running handlers.
+func (st *serverTester) awaitHandlersDone() {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ch := make(chan uint32, 1)
+		st.sc.serveMsgCh <- func(int) {
+			ch <- st.sc.curHandlers
+		}
+		if <-ch == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			st.t.Fatal("timeout waiting for handlers to exit")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// wantIdle waits for all handlers to exit and then verifies that the
+// server has no further frames to write.
+func (st *serverTester) wantIdle() {
+	st.awaitHandlersDone()
+	st.sync()
+}
+
 func (st *serverTester) wantSettingsAck() {
 	f, err := st.readFrame()
 	if err != nil {
@@ -3881,6 +3972,238 @@ func TestUnreadFlowControlReturned_Server(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServerReturnsStreamAndConnFlowControlOnBodyClose(t *testing.T) {
+	unblockHandler := make(chan struct{})
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		r.Body.Close()
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		<-unblockHandler
+	})
+	defer st.Close()
+	defer close(unblockHandler)
+
+	st.greet()
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: st.encodeHeader(":method", "POST"),
+		EndHeaders:    true,
+	})
+	st.wantHeaders()
+	const size = 4 << 10
+	st.writeData(1, false, make([]byte, size))
+	st.wantWindowUpdate(0, size) // conn-level flow control is returned
+	unblockHandler <- struct{}{}
+	st.wantData()
+}
+
+// serverHandlerCall is a server handler invocation driven by the test.
+type serverHandlerCall struct {
+	req   *http.Request
+	funcc chan func(http.ResponseWriter, *http.Request)
+	donec chan struct{}
+}
+
+// newServerHandlerCalls returns a server handler which passes each
+// invocation to the test on the returned channel. The handler runs
+// functions passed to do, and returns when exit is called.
+func newServerHandlerCalls() (http.HandlerFunc, <-chan *serverHandlerCall) {
+	callc := make(chan *serverHandlerCall)
+	return func(w http.ResponseWriter, req *http.Request) {
+		call := &serverHandlerCall{
+			req:   req,
+			funcc: make(chan func(http.ResponseWriter, *http.Request)),
+			donec: make(chan struct{}),
+		}
+		callc <- call
+		for f := range call.funcc {
+			f(w, req)
+			call.donec <- struct{}{}
+		}
+	}, callc
+}
+
+// do runs f in the handler goroutine and waits for it to return.
+func (call *serverHandlerCall) do(f func(http.ResponseWriter, *http.Request)) {
+	call.funcc <- f
+	<-call.donec
+}
+
+// exit causes the handler to return.
+func (call *serverHandlerCall) exit() {
+	close(call.funcc)
+}
+
+// Connection-level flow control for request body data must be returned
+// to the client exactly once, no matter whether the stream is reset,
+// the handler reads the body, or the handler exits (golang.org/issue/16481).
+func TestServerResetStreamUnreadBody(t *testing.T) {
+	const size = 4 << 10
+
+	t.Run("read_after_reset", func(t *testing.T) {
+		handler, callc := newServerHandlerCalls()
+		st := newServerTester(t, handler)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := <-callc
+
+		st.writeData(1, false, make([]byte, size))
+		st.writeRSTStream(1, ErrCodeCancel)
+		st.sync()
+
+		// The handler reads the body after the stream has been reset.
+		call.do(func(w http.ResponseWriter, req *http.Request) {
+			ioutil.ReadAll(req.Body)
+		})
+		st.wantConnWindowUpdates(size)
+
+		// Handler exits; no second refund.
+		call.exit()
+		st.wantIdle()
+	})
+
+	t.Run("exit_without_reading", func(t *testing.T) {
+		handler, callc := newServerHandlerCalls()
+		st := newServerTester(t, handler)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := <-callc
+
+		st.writeData(1, false, make([]byte, size))
+		st.writeRSTStream(1, ErrCodeCancel)
+		st.sync()
+
+		// The handler exits without reading the body. Flow control is returned on exit.
+		call.exit()
+		st.wantWindowUpdate(0, size)
+		st.wantIdle()
+	})
+
+	t.Run("read_after_handler_exit", func(t *testing.T) {
+		handler, callc := newServerHandlerCalls()
+		st := newServerTester(t, handler)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := <-callc
+
+		st.writeData(1, false, make([]byte, size))
+		st.sync()
+
+		// The handler exits without reading the body.
+		call.exit()
+
+		// Flow control is returned when the handler exits.
+		st.wantUnorderedFrames(
+			func(f Frame) bool {
+				wu, ok := f.(*WindowUpdateFrame)
+				return ok && wu.StreamID == 0 && wu.Increment == size
+			},
+			func(f Frame) bool {
+				hf, ok := f.(*HeadersFrame)
+				return ok && hf.StreamID == 1 && hf.StreamEnded()
+			},
+			func(f Frame) bool {
+				rs, ok := f.(*RSTStreamFrame)
+				return ok && rs.StreamID == 1 && rs.ErrCode == ErrCodeNo
+			},
+		)
+
+		// Reading the body after the handler exits must not cause a double refund.
+		ioutil.ReadAll(call.req.Body)
+		st.wantIdle()
+	})
+
+	t.Run("unstarted_handler", func(t *testing.T) {
+		handler, callc := newServerHandlerCalls()
+		st := newServerTester(t, handler, func(s *Server) {
+			s.MaxConcurrentStreams = 1
+		})
+		defer st.Close()
+
+		st.greet()
+
+		// Stream 1 uses the single handler slot.
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(),
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+		call := <-callc
+
+		// Reset stream 1 so the client can open another stream without
+		// exceeding the concurrent stream limit.
+		st.writeRSTStream(1, ErrCodeCancel)
+
+		// Stream 3 is queued in unstartedHandlers because the handler for
+		// stream 1 is still executing.
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      3,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+
+		st.writeData(3, false, make([]byte, size))
+		st.writeRSTStream(3, ErrCodeCancel)
+		// The handler for stream 1 is still running, so only check
+		// that the reset did not return any flow control.
+		st.sync()
+
+		// Stream 1 handler exits. Stream 3 is removed from unstartedHandlers
+		// and its flow control is returned.
+		call.exit()
+		st.wantWindowUpdate(0, size)
+		st.wantIdle()
+	})
+
+	// Same thing as exit_without_reading, but some imaginary middleware
+	// replaced Request.Body first.
+	t.Run("middleware_replaces_body", func(t *testing.T) {
+		handler, callc := newServerHandlerCalls()
+		st := newServerTester(t, handler)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := <-callc
+
+		call.do(func(w http.ResponseWriter, r *http.Request) {
+			// Wrap r.Body like some middleware might.
+			r.Body = http.MaxBytesReader(w, r.Body, 1000)
+		})
+
+		st.writeData(1, false, make([]byte, size))
+		st.writeRSTStream(1, ErrCodeCancel)
+		st.sync()
+
+		call.exit()
+		st.wantWindowUpdate(0, size)
+		st.wantIdle()
+	})
 }
 
 func TestServerIdleTimeout(t *testing.T) {
