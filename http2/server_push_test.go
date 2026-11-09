@@ -517,3 +517,54 @@ func TestServer_Push_RejectAfterGoAway(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestServer_Push_Underflow(t *testing.T) {
+	// Test for golang/go#63511: a pushed stream runs its own handler
+	// goroutine, which must be counted like any other running handler.
+	// Otherwise finishing it underflows the running handler count, and
+	// later requests on the connection never get a handler started.
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.RequestURI() {
+		case "/":
+			if err := w.(http.Pusher).Push("/pushed", nil); err != nil {
+				t.Errorf("error pushing: %v", err)
+			}
+			w.WriteHeader(200)
+		case "/pushed":
+			w.WriteHeader(200)
+		default:
+			t.Errorf("unknown RequestURL %q", r.URL.RequestURI())
+		}
+	})
+	defer st.Close()
+	st.greet()
+
+	// Send several requests, one at a time.
+	// Each request should result in one PUSH_PROMISE and two responses.
+	const numRequests = 5
+	for i := 0; i < numRequests; i++ {
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      uint32(1 + i*2), // clients send odd numbers
+			BlockFragment: st.encodeHeader(),
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+		numPushPromises := 0
+		numHeaders := 0
+		for numHeaders < 2 || numPushPromises < 1 {
+			f, err := st.readFrame()
+			if err != nil {
+				t.Fatalf("request %d: %v", i, err)
+			}
+			switch f := f.(type) {
+			case *HeadersFrame:
+				if !f.Flags.Has(FlagHeadersEndStream) {
+					t.Fatalf("request %d: got HEADERS frame with no END_STREAM, expected END_STREAM: %v", i, f)
+				}
+				numHeaders++
+			case *PushPromiseFrame:
+				numPushPromises++
+			}
+		}
+	}
+}
