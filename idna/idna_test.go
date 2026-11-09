@@ -106,3 +106,11 @@ func TestIDNASeparators(t *testing.T) {
 
 // TODO(nigeltao): test errors, once we've specified when ToASCII and ToUnicode
 // return errors.
+
+func TestToUnicodeRejectsASCIIPunycodeLabel(t *testing.T) {
+	// UTS #46 revision 33: reject xn-- labels that decode to all-ASCII.
+	_, err := ToUnicode("xn--hello-")
+	if err == nil {
+		t.Fatal("expected error for all-ASCII punycode label")
+	}
+}
