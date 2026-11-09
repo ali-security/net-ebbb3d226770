@@ -4490,3 +4490,97 @@ Frames:
 		close(s)
 	}
 }
+
+func TestServerContinuationFlood(t *testing.T) {
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println(r.Header)
+	}, func(ts *httptest.Server) {
+		ts.Config.MaxHeaderBytes = 4096
+	})
+	defer st.Close()
+
+	st.writePreface()
+	st.writeInitialSettings()
+	st.writeSettingsAck()
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: st.encodeHeader(),
+		EndStream:     true,
+	})
+	for i := 0; i < 1000; i++ {
+		st.fr.WriteContinuation(1, false, st.encodeHeaderRaw(
+			fmt.Sprintf("x-%v", i), "1234567890",
+		))
+	}
+	st.fr.WriteContinuation(1, true, st.encodeHeaderRaw(
+		"x-last-header", "1",
+	))
+
+	for {
+		f, err := st.readFrame()
+		if err != nil {
+			break
+		}
+		switch f := f.(type) {
+		case *HeadersFrame:
+			t.Fatalf("received HEADERS frame; want GOAWAY and a closed connection")
+		case *GoAwayFrame:
+			// We might not see the GOAWAY (see below), but if we do it should
+			// indicate that the server processed this request so the client doesn't
+			// attempt to retry it.
+			if got, want := f.LastStreamID, uint32(1); got != want {
+				t.Errorf("received GOAWAY with LastStreamId %v, want %v", got, want)
+			}
+
+		}
+	}
+	// We expect to have seen a GOAWAY before the connection closes,
+	// but the server will close the connection after one second
+	// whether or not it has finished sending the GOAWAY. On windows-amd64-race
+	// builders, this fairly consistently results in the connection closing without
+	// the GOAWAY being sent.
+	//
+	// Since the server's behavior is inherently racy here and the important thing
+	// is that the connection is closed, don't check for the GOAWAY having been sent.
+}
+
+func TestServerContinuationAfterInvalidHeader(t *testing.T) {
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println(r.Header)
+	})
+	defer st.Close()
+
+	st.writePreface()
+	st.writeInitialSettings()
+	st.writeSettingsAck()
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: st.encodeHeader(),
+		EndStream:     true,
+	})
+	st.fr.WriteContinuation(1, false, st.encodeHeaderRaw(
+		"x-invalid-header", "\x00",
+	))
+	st.fr.WriteContinuation(1, true, st.encodeHeaderRaw(
+		"x-valid-header", "1",
+	))
+
+	var sawGoAway bool
+	for {
+		f, err := st.readFrame()
+		if err != nil {
+			break
+		}
+		switch f.(type) {
+		case *GoAwayFrame:
+			sawGoAway = true
+		case *HeadersFrame:
+			t.Fatalf("received HEADERS frame; want GOAWAY")
+		}
+	}
+	if !sawGoAway {
+		t.Errorf("connection closed with no GOAWAY frame; want one")
+	}
+}

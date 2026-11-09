@@ -1053,6 +1053,33 @@ func TestMetaFrameHeader(t *testing.T) {
 			want:          streamError(1, ErrCodeProtocol),
 			wantErrReason: "invalid header field value \"bad_null\\x00\"",
 		},
+		13: {
+			name: "continuation_after_max_header_list_exceeded",
+			w: func(f *Framer) {
+				var he hpackEncoder
+				var pairs = []string{":method", "GET", ":path", "/"}
+				for i := 0; i < 100; i++ {
+					pairs = append(pairs, "foo", "bar")
+				}
+				all := he.encodeHeaderRaw(t, pairs...)
+				write(f, all[:2], all[2:len(all)-1], all[len(all)-1:])
+			},
+			maxHeaderListSize: (1 << 10) / 2,
+			want:              ConnectionError(ErrCodeProtocol),
+		},
+		14: {
+			name: "fragment_exceeds_twice_remaining_header_list_size",
+			w: func(f *Framer) {
+				var he hpackEncoder
+				var pairs = []string{":method", "GET", ":path", "/"}
+				for i := 0; i < 200; i++ {
+					pairs = append(pairs, fmt.Sprintf("x-%v", i), "1234567890")
+				}
+				write(f, he.encodeHeaderRaw(t, pairs...))
+			},
+			maxHeaderListSize: (1 << 10) / 2,
+			want:              ConnectionError(ErrCodeProtocol),
+		},
 	}
 	for i, tt := range tests {
 		buf := new(bytes.Buffer)
