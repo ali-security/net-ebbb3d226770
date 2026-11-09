@@ -1,0 +1,132 @@
+name: seal-build
+# Upstream golang.org/x/net has no GitHub Actions CI; this workflow packs the
+# module zip (as proxy.golang.org serves it) and runs the project's own
+# `go test ./...` suite on Linux, Windows and macOS.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Package pattern / -run selector for go test (empty = full suite)'
+        required: false
+        default: ''
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  module-zip:
+    name: module-zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MODULE: golang.org/x/net
+      VERSION: v0.0.0-20210224082022-3d97a244fca7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'   # only for the x/mod zip helper, not the module under test
+      - name: Build x/mod zip helper
+        run: |
+          HELPER="$(mktemp -d)"
+          cp .github/create_mod.go "$HELPER/"
+          cd "$HELPER"
+          go mod init sealhelper
+          go get golang.org/x/mod@v0.24.0
+          go build -o "${RUNNER_TEMP}/create_mod" .
+      - name: Pack module zip
+        run: |
+          # The seal workflow and helper must not ship in the module zip
+          # (upstream has no .github directory at this commit).
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          mkdir -p "${RUNNER_TEMP}/out"
+          "${RUNNER_TEMP}/create_mod" "$MODULE" "$VERSION" "$GITHUB_WORKSPACE" "${RUNNER_TEMP}/out/${VERSION}.zip"
+          unzip -l "${RUNNER_TEMP}/out/${VERSION}.zip" | tail -n 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.0.0-20210224082022-3d97a244fca7.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            go: '1.16'
+            testflags: ''
+          - os: windows-latest
+            go: '1.16'
+            testflags: ''
+          - os: macos-latest
+            go: '1.23'   # macos arm64 linker needs LC_UUID (Go >=1.23); older Go aborts (signal abort trap)
+            testflags: '-ldflags=-checklinkname=0'   # Go 1.23 linkname enforcement escape for internal/socket syscall.recvmsg (flag only exists in Go >=1.23)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Provide gohttp2/curl image for http2 curl interop tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # upstream http2/Dockerfile (ubuntu:trusty + curl from source) is no longer buildable;
+          # the tests only need a curl with HTTP/2 under the gohttp2/curl tag.
+          mkdir -p "${RUNNER_TEMP}/curlimg"
+          printf 'FROM curlimages/curl:8.11.1\nENTRYPOINT ["/usr/bin/curl"]\n' > "${RUNNER_TEMP}/curlimg/Dockerfile"
+          docker build -t gohttp2/curl "${RUNNER_TEMP}/curlimg"
+          # allow unprivileged ICMP sockets so icmp non-privileged listen tests run
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          # GitHub's Linux runners leave the loopback without the MULTICAST flag, so
+          # ipv4 TestPacketConnReadWriteMulticastUDP finds no multicast interface; enable it.
+          sudo ip link set dev lo multicast on
+          ip link show dev lo
+      - name: Test
+        run: |
+          go version
+          go test -v ${{ matrix.testflags }} ${{ inputs.test-filter || './...' }} 2>&1 | tee "${RUNNER_TEMP}/test.log"
+      - name: Root-only route test (macOS)
+        if: runner.os == 'macOS' && inputs.test-filter == ''
+        run: |
+          # route.TestMonitorAndParseRIB skips unless uid 0; run it as root here.
+          sudo env "PATH=$PATH" "GOCACHE=${RUNNER_TEMP}/rootgocache" "GOPATH=${RUNNER_TEMP}/rootgopath" \
+            go test -v ${{ matrix.testflags }} -run 'TestMonitorAndParseRIB' ./route
+      - name: Test summary and skip reasons
+        if: always()
+        run: |
+          LOG="${RUNNER_TEMP}/test.log"
+          echo "===== SKIPPED TESTS (name and reason) ====="
+          awk '
+            { sub(/\r$/, "") }
+            /^=== RUN/   { cur = $3; why[cur] = ""; next }
+            /^=== (CONT|PAUSE)/ { cur = $3; next }
+            /^ +[A-Za-z0-9_]+\.go:[0-9]+:/ {
+              if (cur != "") { l = $0; sub(/^ +/, "", l); why[cur] = why[cur] " " l }
+              next
+            }
+            /--- SKIP:/ {
+              r = why[$3]
+              # a t.Skip() with no message still prints "file.go:N: " - treat as empty
+              if (r ~ /^ *[A-Za-z0-9_]+\.go:[0-9]+: *$/) r = ""
+              if ($3 == "TestMonitorAndParseRIB") r = r " (route socket test needs root; run under sudo in the next step)"
+              if ($3 == "TestSpecCoverage" && r == "") r = " opt-in spec coverage report, runs only with the -coverspec test flag (http2/z_spec_test.go)"
+              if (r == "") r = " (no t.Skip message printed)"
+              print "SKIPPED: " $3 " reason:" r
+            }
+          ' "$LOG"
+          echo "===== TEST SUMMARY ====="
+          awk '
+            { sub(/\r$/, "") }
+            /--- PASS:/ { p++ }
+            /--- FAIL:/ { f++ }
+            /--- SKIP:/ { s++ }
+            /^ok[ \t]/  { okp++ }
+            /^FAIL[ \t]/ { failp++ }
+            END {
+              printf "tests passed: %d, failed: %d, skipped: %d; packages ok: %d, packages failed: %d\n", p, f, s, okp, failp
+            }
+          ' "$LOG"
