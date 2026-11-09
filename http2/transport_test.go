@@ -2314,6 +2314,281 @@ func TestTransportRejectsContentLengthWithSign(t *testing.T) {
 	}
 }
 
+// testTransportResponseFields sends a request with the given method and has
+// the server answer it with a HEADERS frame carrying ":status: 200" followed
+// by the given header fields (name/value pairs). If body is nil, the HEADERS
+// frame ends the stream; otherwise it is followed by a DATA frame carrying
+// body with END_STREAM set. It checks that the client reads exactly body and
+// returns the response the client received.
+func testTransportResponseFields(t *testing.T, method string, fields []string, body []byte) *http.Response {
+	ct := newClientTester(t)
+	var res *http.Response
+	ct.client = func() error {
+		req, _ := http.NewRequest(method, "https://dummy.tld/", nil)
+		r, err := ct.tr.RoundTrip(req)
+		if err != nil {
+			return fmt.Errorf("RoundTrip: %v", err)
+		}
+		defer r.Body.Close()
+		got, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			return fmt.Errorf("reading body: %v", err)
+		}
+		if !bytes.Equal(got, body) {
+			return fmt.Errorf("got body %q, want %q", got, body)
+		}
+		res = r
+		return nil
+	}
+	ct.server = func() error {
+		ct.greet()
+		hf, err := ct.firstHeaders()
+		if err != nil {
+			return err
+		}
+		var buf bytes.Buffer
+		enc := hpack.NewEncoder(&buf)
+		enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+		for i := 0; i+1 < len(fields); i += 2 {
+			enc.WriteField(hpack.HeaderField{Name: fields[i], Value: fields[i+1]})
+		}
+		if err := ct.fr.WriteHeaders(HeadersFrameParam{
+			StreamID:      hf.StreamID,
+			EndHeaders:    true,
+			EndStream:     body == nil,
+			BlockFragment: buf.Bytes(),
+		}); err != nil {
+			return err
+		}
+		if body == nil {
+			return nil
+		}
+		return ct.fr.WriteData(hf.StreamID, true, body)
+	}
+	ct.run()
+	if res == nil {
+		t.FailNow()
+	}
+	return res
+}
+
+// equalHeaderValues reports whether got and want hold the same values,
+// treating nil and empty as equal.
+func equalHeaderValues(got, want []string) bool {
+	if len(got) == 0 || len(want) == 0 {
+		return len(got) == len(want)
+	}
+	return reflect.DeepEqual(got, want)
+}
+
+// equalHeaders reports whether got and want hold the same fields, treating
+// nil and empty as equal.
+func equalHeaders(got, want http.Header) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for k, wv := range want {
+		gv, ok := got[k]
+		if !ok || !equalHeaderValues(gv, wv) {
+			return false
+		}
+	}
+	return true
+}
+
+// TestTransportResponseContentLength checks that a Content-Length we cannot
+// validate is dropped from the response rather than passed on to the caller,
+// who may be forwarding it to an HTTP/1 endpoint.
+func TestTransportResponseContentLength(t *testing.T) {
+	tests := []struct {
+		name     string
+		clValues []string
+		wantLen  int // -1 means the header is expected to be dropped.
+	}{
+		{
+			name:     "single value",
+			clValues: []string{"3"},
+			wantLen:  3,
+		},
+		{
+			name:     "identical duplicate values",
+			clValues: []string{"3", "3", "3"},
+			wantLen:  3,
+		},
+		{
+			name:     "different duplicate values",
+			clValues: []string{"3", "1", "3"},
+			wantLen:  -1,
+		},
+		{
+			name:     "extraneous whitespace",
+			clValues: []string{" 3"},
+			wantLen:  -1,
+		},
+		{
+			name:     "identical duplicate values with extraneous whitespace",
+			clValues: []string{"3", "3", " 3"},
+			wantLen:  -1,
+		},
+		{
+			name:     "plus sign",
+			clValues: []string{"+3"},
+			wantLen:  -1,
+		},
+		{
+			name:     "non-numeric",
+			clValues: []string{"abc"},
+			wantLen:  -1,
+		},
+		{
+			name:     "empty value",
+			clValues: []string{""},
+			wantLen:  -1,
+		},
+		{
+			name:    "no header",
+			wantLen: -1,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			var fields []string
+			for _, val := range tt.clValues {
+				fields = append(fields, "content-length", val)
+			}
+			bodyLen := tt.wantLen
+			if bodyLen < 1 {
+				bodyLen = 1
+			}
+			body := bytes.Repeat([]byte("a"), bodyLen)
+
+			res := testTransportResponseFields(t, "GET", fields, body)
+
+			if res.ContentLength != int64(tt.wantLen) {
+				t.Errorf("got ContentLength = %d, want %d", res.ContentLength, tt.wantLen)
+			}
+			var wantHeader []string
+			if tt.wantLen >= 0 {
+				wantHeader = []string{strconv.FormatInt(int64(tt.wantLen), 10)}
+			}
+			if got := res.Header["Content-Length"]; !equalHeaderValues(got, wantHeader) {
+				t.Errorf("got Header[%q] = %q, want %q", "Content-Length", got, wantHeader)
+			}
+		})
+	}
+}
+
+// TestTransportResponseConnHeaders checks that connection-related headers,
+// which are not valid in HTTP/2 and which an HTTP/1 endpoint may use for
+// framing, are dropped from the response.
+func TestTransportResponseConnHeaders(t *testing.T) {
+	tests := []struct {
+		name       string
+		fields     []string
+		wantHeader http.Header
+	}{
+		{
+			name:       "unaffected header",
+			fields:     []string{"content-type", "text/plain"},
+			wantHeader: http.Header{"Content-Type": {"text/plain"}},
+		},
+		{
+			name:   "transfer-encoding",
+			fields: []string{"transfer-encoding", "chunked"},
+		},
+		{
+			name:   "transfer-encoding alongside content-length",
+			fields: []string{"content-length", "-1", "transfer-encoding", "chunked"},
+		},
+		{
+			name:   "connection and keep-alive",
+			fields: []string{"connection", "keep-alive", "keep-alive", "timeout=5"},
+		},
+		{
+			name:   "proxy-connection",
+			fields: []string{"proxy-connection", "keep-alive"},
+		},
+		{
+			name:   "upgrade",
+			fields: []string{"upgrade", "websocket"},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			res := testTransportResponseFields(t, "GET", tt.fields, []byte("body"))
+
+			if !equalHeaders(res.Header, tt.wantHeader) {
+				t.Errorf("got Header = %q, want %q", res.Header, tt.wantHeader)
+			}
+		})
+	}
+}
+
+// TestTransportResponseFramingHeadersNoData checks that invalid Content-Length
+// values and connection-related headers are also dropped from responses whose
+// HEADERS frame ends the stream, including responses to HEAD requests.
+func TestTransportResponseFramingHeadersNoData(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		fields     []string
+		wantLen    int64
+		wantHeader http.Header
+	}{
+		{
+			name:   "GET with conflicting content-length and transfer-encoding",
+			method: "GET",
+			fields: []string{
+				"content-length", "3",
+				"content-length", "1",
+				"transfer-encoding", "chunked",
+				"connection", "close",
+				"content-type", "text/plain",
+			},
+			wantLen:    0,
+			wantHeader: http.Header{"Content-Type": {"text/plain"}},
+		},
+		{
+			name:   "HEAD with conflicting content-length and transfer-encoding",
+			method: "HEAD",
+			fields: []string{
+				"content-length", "3",
+				"content-length", "1",
+				"transfer-encoding", "chunked",
+				"upgrade", "websocket",
+				"content-type", "text/plain",
+			},
+			wantLen:    -1,
+			wantHeader: http.Header{"Content-Type": {"text/plain"}},
+		},
+		{
+			name:   "HEAD with identical duplicate content-length",
+			method: "HEAD",
+			fields: []string{
+				"content-length", "3",
+				"content-length", "3",
+			},
+			wantLen:    3,
+			wantHeader: http.Header{"Content-Length": {"3"}},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			res := testTransportResponseFields(t, tt.method, tt.fields, nil)
+
+			if res.ContentLength != tt.wantLen {
+				t.Errorf("got ContentLength = %d, want %d", res.ContentLength, tt.wantLen)
+			}
+			if !equalHeaders(res.Header, tt.wantHeader) {
+				t.Errorf("got Header = %q, want %q", res.Header, tt.wantHeader)
+			}
+		})
+	}
+}
+
 // golang.org/issue/14048
 func TestTransportFailsOnInvalidHeaders(t *testing.T) {
 	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
