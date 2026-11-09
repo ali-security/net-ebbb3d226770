@@ -366,27 +366,26 @@ func (s *Server) ServeConn(c net.Conn, opts *ServeConnOpts) {
 	defer cancel()
 
 	sc := &serverConn{
-		srv:                         s,
-		hs:                          opts.baseConfig(),
-		conn:                        c,
-		baseCtx:                     baseCtx,
-		remoteAddrStr:               c.RemoteAddr().String(),
-		bw:                          newBufferedWriter(c),
-		handler:                     opts.handler(),
-		streams:                     make(map[uint32]*stream),
-		readFrameCh:                 make(chan readFrameResult),
-		wantWriteFrameCh:            make(chan FrameWriteRequest, 8),
-		serveMsgCh:                  make(chan interface{}, 8),
-		wroteFrameCh:                make(chan frameWriteResult, 1), // buffered; one send in writeFrameAsync
-		bodyReadCh:                  make(chan bodyReadMsg),         // buffering doesn't matter either way
-		doneServing:                 make(chan struct{}),
-		clientMaxStreams:            math.MaxUint32, // Section 6.5.2: "Initially, there is no limit to this value"
-		advMaxStreams:               s.maxConcurrentStreams(),
-		initialStreamSendWindowSize: initialWindowSize,
-		maxFrameSize:                initialMaxFrameSize,
-		headerTableSize:             initialHeaderTableSize,
-		serveG:                      newGoroutineLock(),
-		pushEnabled:                 true,
+		srv:              s,
+		hs:               opts.baseConfig(),
+		conn:             c,
+		baseCtx:          baseCtx,
+		remoteAddrStr:    c.RemoteAddr().String(),
+		bw:               newBufferedWriter(c),
+		handler:          opts.handler(),
+		streams:          make(map[uint32]*stream),
+		readFrameCh:      make(chan readFrameResult),
+		wantWriteFrameCh: make(chan FrameWriteRequest, 8),
+		serveMsgCh:       make(chan interface{}, 8),
+		wroteFrameCh:     make(chan frameWriteResult, 1), // buffered; one send in writeFrameAsync
+		bodyReadCh:       make(chan bodyReadMsg),         // buffering doesn't matter either way
+		doneServing:      make(chan struct{}),
+		clientMaxStreams: math.MaxUint32, // Section 6.5.2: "Initially, there is no limit to this value"
+		advMaxStreams:    s.maxConcurrentStreams(),
+		maxFrameSize:     initialMaxFrameSize,
+		headerTableSize:  initialHeaderTableSize,
+		serveG:           newGoroutineLock(),
+		pushEnabled:      true,
 	}
 
 	s.state.registerConn(sc)
@@ -410,7 +409,7 @@ func (s *Server) ServeConn(c net.Conn, opts *ServeConnOpts) {
 	// These start at the RFC-specified defaults. If there is a higher
 	// configured value for inflow, that will be updated when we send a
 	// WINDOW_UPDATE shortly after sending SETTINGS.
-	sc.flow.add(initialWindowSize)
+	sc.flow.init()
 	sc.inflow.add(initialWindowSize)
 	sc.hpackEncoder = hpack.NewEncoder(&sc.headerWriteBuf)
 
@@ -504,43 +503,42 @@ type serverConn struct {
 	wroteFrameCh     chan frameWriteResult  // from writeFrameAsync -> serve, tickles more frame writes
 	bodyReadCh       chan bodyReadMsg       // from handlers -> serve
 	serveMsgCh       chan interface{}       // misc messages & code to send to / run on the serve loop
-	flow             flow                   // conn-wide (not stream-specific) outbound flow control
+	flow             connOutflow            // conn-wide (not stream-specific) outbound flow control
 	inflow           flow                   // conn-wide inbound flow control
 	tlsState         *tls.ConnectionState   // shared by all handlers, like net/http
 	remoteAddrStr    string
 	writeSched       WriteScheduler
 
 	// Everything following is owned by the serve loop; use serveG.check():
-	serveG                      goroutineLock // used to verify funcs are on serve()
-	pushEnabled                 bool
-	sawFirstSettings            bool // got the initial SETTINGS frame after the preface
-	needToSendSettingsAck       bool
-	unackedSettings             int    // how many SETTINGS have we sent without ACKs?
-	queuedControlFrames         int    // control frames in the writeSched queue
-	clientMaxStreams            uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
-	advMaxStreams               uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
-	curClientStreams            uint32 // number of open streams initiated by the client
-	curPushedStreams            uint32 // number of open streams initiated by server push
-	curHandlers                 uint32 // number of running handler goroutines
-	maxClientStreamID           uint32 // max ever seen from client (odd), or 0 if there have been no client requests
-	maxPushPromiseID            uint32 // ID of the last push promise (even), or 0 if there have been no pushes
-	streams                     map[uint32]*stream
-	unstartedHandlers           []unstartedHandler
-	initialStreamSendWindowSize int32
-	maxFrameSize                int32
-	headerTableSize             uint32
-	peerMaxHeaderListSize       uint32            // zero means unknown (default)
-	canonHeader                 map[string]string // http2-lower-case -> Go-Canonical-Case
-	canonHeaderKeysSize         int               // canonHeader keys size in bytes
-	writingFrame                bool              // started writing a frame (on serve goroutine or separate)
-	writingFrameAsync           bool              // started a frame on its own goroutine but haven't heard back on wroteFrameCh
-	needsFrameFlush             bool              // last frame write wasn't a flush
-	inGoAway                    bool              // we've started to or sent GOAWAY
-	inFrameScheduleLoop         bool              // whether we're in the scheduleFrameWrite loop
-	needToSendGoAway            bool              // we need to schedule a GOAWAY frame write
-	goAwayCode                  ErrCode
-	shutdownTimer               *time.Timer // nil until used
-	idleTimer                   *time.Timer // nil if unused
+	serveG                goroutineLock // used to verify funcs are on serve()
+	pushEnabled           bool
+	sawFirstSettings      bool // got the initial SETTINGS frame after the preface
+	needToSendSettingsAck bool
+	unackedSettings       int    // how many SETTINGS have we sent without ACKs?
+	queuedControlFrames   int    // control frames in the writeSched queue
+	clientMaxStreams      uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
+	advMaxStreams         uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
+	curClientStreams      uint32 // number of open streams initiated by the client
+	curPushedStreams      uint32 // number of open streams initiated by server push
+	curHandlers           uint32 // number of running handler goroutines
+	maxClientStreamID     uint32 // max ever seen from client (odd), or 0 if there have been no client requests
+	maxPushPromiseID      uint32 // ID of the last push promise (even), or 0 if there have been no pushes
+	streams               map[uint32]*stream
+	unstartedHandlers     []unstartedHandler
+	maxFrameSize          int32
+	headerTableSize       uint32
+	peerMaxHeaderListSize uint32            // zero means unknown (default)
+	canonHeader           map[string]string // http2-lower-case -> Go-Canonical-Case
+	canonHeaderKeysSize   int               // canonHeader keys size in bytes
+	writingFrame          bool              // started writing a frame (on serve goroutine or separate)
+	writingFrameAsync     bool              // started a frame on its own goroutine but haven't heard back on wroteFrameCh
+	needsFrameFlush       bool              // last frame write wasn't a flush
+	inGoAway              bool              // we've started to or sent GOAWAY
+	inFrameScheduleLoop   bool              // whether we're in the scheduleFrameWrite loop
+	needToSendGoAway      bool              // we need to schedule a GOAWAY frame write
+	goAwayCode            ErrCode
+	shutdownTimer         *time.Timer // nil until used
+	idleTimer             *time.Timer // nil if unused
 
 	// Owned by the writeFrameAsync goroutine:
 	headerWriteBuf bytes.Buffer
@@ -584,10 +582,10 @@ type stream struct {
 	cancelCtx func()
 
 	// owned by serverConn's serve loop:
-	bodyBytes        int64 // body bytes seen so far
-	declBodyBytes    int64 // or -1 if undeclared
-	flow             flow  // limits writing from Handler to client
-	inflow           flow  // what the client is allowed to POST/etc to us
+	bodyBytes        int64   // body bytes seen so far
+	declBodyBytes    int64   // or -1 if undeclared
+	flow             outflow // limits writing from Handler to client
+	inflow           flow    // what the client is allowed to POST/etc to us
 	state            streamState
 	resetQueued      bool        // RST_STREAM queued for write; set by sc.resetStream
 	gotTrailerHeader bool        // HEADER frame for trailers was seen
@@ -1264,6 +1262,11 @@ func (sc *serverConn) scheduleFrameWrite() {
 	}
 	sc.inFrameScheduleLoop = true
 	for !sc.writingFrameAsync {
+		if sc.flow.flowErr && (!sc.inGoAway || sc.goAwayCode == ErrCodeNo) {
+			sc.inGoAway = true
+			sc.needToSendGoAway = true
+			sc.goAwayCode = ErrCodeFlowControl
+		}
 		if sc.needToSendGoAway {
 			sc.needToSendGoAway = false
 			sc.startFrameWrite(FrameWriteRequest{
@@ -1285,6 +1288,9 @@ func (sc *serverConn) scheduleFrameWrite() {
 					sc.queuedControlFrames--
 				}
 				sc.startFrameWrite(wr)
+				continue
+			}
+			if sc.flow.flowErr {
 				continue
 			}
 		}
@@ -1498,6 +1504,10 @@ func (sc *serverConn) processWindowUpdate(f *WindowUpdateFrame) error {
 			return nil
 		}
 		if !st.flow.add(int32(f.Increment)) {
+			if st.flow.conn.flowErr {
+				// This is a lazily-detected connection-level flow control error.
+				return ConnectionError(ErrCodeFlowControl)
+			}
 			return streamError(f.StreamID, ErrCodeFlowControl)
 		}
 	default: // connection-level flow control
@@ -1635,19 +1645,14 @@ func (sc *serverConn) processSettingInitialWindowSize(val uint32) error {
 	// adjust the size of all stream flow control windows that it
 	// maintains by the difference between the new value and the
 	// old value."
-	old := sc.initialStreamSendWindowSize
-	sc.initialStreamSendWindowSize = int32(val)
-	growth := int32(val) - old // may be negative
-	for _, st := range sc.streams {
-		if !st.flow.add(growth) {
-			// 6.9.2 Initial Flow Control Window Size
-			// "An endpoint MUST treat a change to
-			// SETTINGS_INITIAL_WINDOW_SIZE that causes any flow
-			// control window to exceed the maximum size as a
-			// connection error (Section 5.4.1) of type
-			// FLOW_CONTROL_ERROR."
-			return ConnectionError(ErrCodeFlowControl)
-		}
+	if !sc.flow.changeInitialWindowSize(int64(val)) {
+		// 6.9.2 Initial Flow Control Window Size
+		// "An endpoint MUST treat a change to
+		// SETTINGS_INITIAL_WINDOW_SIZE that causes any flow
+		// control window to exceed the maximum size as a
+		// connection error (Section 5.4.1) of type
+		// FLOW_CONTROL_ERROR."
+		return ConnectionError(ErrCodeFlowControl)
 	}
 	return nil
 }
@@ -1974,8 +1979,7 @@ func (sc *serverConn) newStream(id, pusherID uint32, state streamState) *stream 
 		cancelCtx: cancelCtx,
 	}
 	st.cw.Init()
-	st.flow.conn = &sc.flow // link to conn-level counter
-	st.flow.add(sc.initialStreamSendWindowSize)
+	st.flow.conn = &sc.flow     // link to conn-level counter
 	st.inflow.conn = &sc.inflow // link to conn-level counter
 	st.inflow.add(sc.srv.initialStreamRecvWindowSize())
 	if sc.hs.WriteTimeout != 0 {

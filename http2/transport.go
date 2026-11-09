@@ -240,10 +240,10 @@ type ClientConn struct {
 	idleTimeout time.Duration // or 0 for never
 	idleTimer   *time.Timer
 
-	mu              sync.Mutex // guards following
-	cond            *sync.Cond // hold mu; broadcast on flow/closed changes
-	flow            flow       // our conn-level flow control quota (cs.flow is per stream)
-	inflow          flow       // peer's conn-level flow control
+	mu              sync.Mutex  // guards following
+	cond            *sync.Cond  // hold mu; broadcast on flow/closed changes
+	flow            connOutflow // our conn-level flow control quota (cs.flow is per stream)
+	inflow          flow        // peer's conn-level flow control
 	closing         bool
 	closed          bool
 	wantSettingsAck bool                     // we sent a SETTINGS frame and haven't heard back
@@ -262,7 +262,6 @@ type ClientConn struct {
 	maxFrameSize          uint32
 	maxConcurrentStreams  uint32
 	peerMaxHeaderListSize uint64
-	initialWindowSize     uint32
 
 	hbuf    bytes.Buffer // HPACK encoder writes into this
 	henc    *hpack.Encoder
@@ -285,12 +284,12 @@ type clientStream struct {
 	requestedGzip bool
 	on100         func() // optional code to run if get a 100 continue response
 
-	flow        flow  // guarded by cc.mu
-	inflow      flow  // guarded by cc.mu
-	bytesRemain int64 // -1 means unknown; owned by transportResponseBody.Read
-	readErr     error // sticky read error; owned by transportResponseBody.Read
-	stopReqBody error // if non-nil, stop writing req body; guarded by cc.mu
-	didReset    bool  // whether we sent a RST_STREAM to the server; guarded by cc.mu
+	flow        outflow // guarded by cc.mu
+	inflow      flow    // guarded by cc.mu
+	bytesRemain int64   // -1 means unknown; owned by transportResponseBody.Read
+	readErr     error   // sticky read error; owned by transportResponseBody.Read
+	stopReqBody error   // if non-nil, stop writing req body; guarded by cc.mu
+	didReset    bool    // whether we sent a RST_STREAM to the server; guarded by cc.mu
 
 	peerReset chan struct{} // closed on peer reset
 	resetErr  error         // populated before peerReset is closed
@@ -644,7 +643,6 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 		readerDone:            make(chan struct{}),
 		nextStreamID:          1,
 		maxFrameSize:          16 << 10,           // spec default
-		initialWindowSize:     65535,              // spec default
 		maxConcurrentStreams:  1000,               // "infinite", per spec. 1000 seems good enough.
 		peerMaxHeaderListSize: 0xffffffffffffffff, // "infinite", per spec. Use 2^64-1 instead.
 		streams:               make(map[uint32]*clientStream),
@@ -661,7 +659,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 	}
 
 	cc.cond = sync.NewCond(&cc.mu)
-	cc.flow.add(int32(initialWindowSize))
+	cc.flow.init()
 
 	// TODO: adjust this writer size to account for frame size +
 	// MTU + crypto/tls record padding.
@@ -889,6 +887,32 @@ func (cc *ClientConn) sendGoAway() error {
 	// Prevent new requests
 	cc.closing = true
 	return nil
+}
+
+func (cc *ClientConn) goAwayAndClose(code ErrCode) {
+	cc.mu.Lock()
+	closed := cc.closed
+	cc.closing = true
+	cc.closed = true
+	cc.mu.Unlock()
+	if closed {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cc.wmu.Lock()
+		cc.fr.WriteGoAway(0, code, nil)
+		cc.bw.Flush()
+		cc.wmu.Unlock()
+	}()
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+	cc.closeForError(fmt.Errorf("http2: closing connection with %v", code))
 }
 
 // closes the client connection immediately. In-flight requests are interrupted.
@@ -1370,6 +1394,9 @@ func (cs *clientStream) writeRequestBody(body io.Reader, bodyCloser io.Closer) (
 				cc.writeStreamReset(cs.ID, ErrCodeCancel, nil)
 				return err
 			case err != nil:
+				if ce, ok := err.(ConnectionError); ok {
+					cc.goAwayAndClose(ErrCode(ce))
+				}
 				return err
 			}
 			cc.wmu.Lock()
@@ -1450,7 +1477,11 @@ func (cs *clientStream) awaitFlowControl(maxBytes int) (taken int32, err error) 
 		if err := cs.checkResetOrDone(); err != nil {
 			return 0, err
 		}
-		if a := cs.flow.available(); a > 0 {
+		a, ok := cs.flow.available()
+		if !ok {
+			return 0, ConnectionError(ErrCodeFlowControl)
+		}
+		if a > 0 {
 			take := a
 			if int(take) > maxBytes {
 
@@ -1695,8 +1726,7 @@ func (cc *ClientConn) newStream() *clientStream {
 		peerReset: make(chan struct{}),
 		done:      make(chan struct{}),
 	}
-	cs.flow.add(int32(cc.initialWindowSize))
-	cs.flow.setConnFlow(&cc.flow)
+	cs.flow.conn = &cc.flow
 	cs.inflow.add(transportDefaultStreamFlow)
 	cs.inflow.setConnFlow(&cc.inflow)
 	cc.nextStreamID += 2
@@ -2388,20 +2418,10 @@ func (rl *clientConnReadLoop) processSettings(f *SettingsFrame) error {
 			// window size of 2^31-1 MUST be treated as a
 			// connection error (Section 5.4.1) of type
 			// FLOW_CONTROL_ERROR.
-			if s.Val > math.MaxInt32 {
+			if !cc.flow.changeInitialWindowSize(int64(s.Val)) {
 				return ConnectionError(ErrCodeFlowControl)
 			}
-
-			// Adjust flow control of currently-open
-			// frames by the difference of the old initial
-			// window size and this one.
-			delta := int32(s.Val) - int32(cc.initialWindowSize)
-			for _, cs := range cc.streams {
-				cs.flow.add(delta)
-			}
 			cc.cond.Broadcast()
-
-			cc.initialWindowSize = s.Val
 		default:
 			// TODO(bradfitz): handle more settings? SETTINGS_HEADER_TABLE_SIZE probably.
 			cc.vlogf("Unhandled Setting: %v", s)
@@ -2430,11 +2450,13 @@ func (rl *clientConnReadLoop) processWindowUpdate(f *WindowUpdateFrame) error {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	fl := &cc.flow
+	var ok bool
 	if cs != nil {
-		fl = &cs.flow
+		ok = cs.flow.add(int32(f.Increment))
+	} else {
+		ok = cc.flow.add(int32(f.Increment))
 	}
-	if !fl.add(int32(f.Increment)) {
+	if !ok {
 		return ConnectionError(ErrCodeFlowControl)
 	}
 	cc.cond.Broadcast()

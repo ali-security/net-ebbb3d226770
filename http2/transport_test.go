@@ -2111,6 +2111,143 @@ func testTransportResponseHeaderTimeout(t *testing.T, body bool) {
 	ct.run()
 }
 
+// "An endpoint MUST treat a change to SETTINGS_INITIAL_WINDOW_SIZE
+// that causes any flow-control window to exceed the maximum size as
+// a connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR."
+// -- https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2-7
+func TestTransportSettingsFlowControlUpdateBeyondLimit(t *testing.T) {
+	testTransportSettingsFlowControlUpdate(t, true)
+}
+
+// Counterpart to TestTransportSettingsFlowControlUpdateBeyondLimit:
+// A SETTINGS update which doesn't quite put a stream over the flow control limit.
+func TestTransportSettingsFlowControlUpdateWithinLimit(t *testing.T) {
+	testTransportSettingsFlowControlUpdate(t, false)
+}
+
+func testTransportSettingsFlowControlUpdate(t *testing.T, beyondLimit bool) {
+	ct := newClientTester(t)
+	pr, pw := io.Pipe()
+	writeBody := make(chan struct{})
+	serverDone := make(chan struct{})
+	ct.client = func() error {
+		go func() {
+			select {
+			case <-writeBody:
+				pw.Write([]byte("a"))
+				pw.Close()
+			case <-serverDone:
+				pw.CloseWithError(errors.New("server finished before request body was written"))
+			}
+		}()
+		req, _ := http.NewRequest("PUT", "https://dummy.tld/", pr)
+		res, err := ct.tr.RoundTrip(req)
+		if beyondLimit {
+			if err == nil {
+				res.Body.Close()
+				return errors.New("RoundTrip succeeded; want flow control error")
+			}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		res.Body.Close()
+		return nil
+	}
+	ct.server = func() error {
+		defer close(serverDone)
+		ct.greet()
+		hf, err := ct.firstHeaders()
+		if err != nil {
+			return err
+		}
+		if hf.StreamEnded() {
+			return errors.New("unexpected END_STREAM on request HEADERS")
+		}
+
+		// Give this stream some additional flow control.
+		const windowIncrease = 1000
+		if err := ct.fr.WriteWindowUpdate(hf.StreamID, windowIncrease); err != nil {
+			return err
+		}
+
+		// Adjust the initial flow control window.
+		const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+		const maxInitialWindowSize = maxWindowSize - windowIncrease
+		settingVal := uint32(maxInitialWindowSize) // The stream is just within the limit.
+		if beyondLimit {
+			settingVal++ // The stream is now over the limit.
+		}
+		if err := ct.fr.WriteSettings(Setting{SettingInitialWindowSize, settingVal}); err != nil {
+			return err
+		}
+
+		// The client processes frames in order: once it has answered
+		// this PING, it has processed the SETTINGS frame above.
+		pingData := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+		if err := ct.fr.WritePing(false, pingData); err != nil {
+			return err
+		}
+	waitPing:
+		for {
+			f, err := ct.readFrame()
+			if err != nil {
+				return fmt.Errorf("ReadFrame while waiting for PING ack: %v", err)
+			}
+			switch f := f.(type) {
+			case *WindowUpdateFrame, *SettingsFrame:
+			case *PingFrame:
+				if f.IsAck() && f.Data == pingData {
+					break waitPing
+				}
+			default:
+				return fmt.Errorf("got %T while waiting for PING ack", f)
+			}
+		}
+
+		// We detect this condition lazily. Write something to the stream so we notice.
+		close(writeBody)
+
+		for {
+			f, err := ct.readFrame()
+			if err != nil {
+				return fmt.Errorf("ReadFrame: %v", err)
+			}
+			switch f := f.(type) {
+			case *WindowUpdateFrame, *SettingsFrame:
+			case *GoAwayFrame:
+				if !beyondLimit {
+					return fmt.Errorf("unexpected GOAWAY with error code %v", f.ErrCode)
+				}
+				if f.ErrCode != ErrCodeFlowControl {
+					return fmt.Errorf("GOAWAY error code = %v; want %v", f.ErrCode, ErrCodeFlowControl)
+				}
+				return nil
+			case *DataFrame:
+				if beyondLimit {
+					return fmt.Errorf("client sent %d bytes of DATA; want GOAWAY with %v", len(f.Data()), ErrCodeFlowControl)
+				}
+				if !f.StreamEnded() {
+					continue
+				}
+				var buf bytes.Buffer
+				enc := hpack.NewEncoder(&buf)
+				enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+				return ct.fr.WriteHeaders(HeadersFrameParam{
+					StreamID:      f.StreamID,
+					EndHeaders:    true,
+					EndStream:     true,
+					BlockFragment: buf.Bytes(),
+				})
+			default:
+				return fmt.Errorf("unexpected frame %T", f)
+			}
+		}
+	}
+	ct.run()
+}
+
 func TestTransportDisableCompression(t *testing.T) {
 	const body = "sup"
 	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
