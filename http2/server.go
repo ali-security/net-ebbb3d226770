@@ -510,35 +510,38 @@ type serverConn struct {
 	writeSched       WriteScheduler
 
 	// Everything following is owned by the serve loop; use serveG.check():
-	serveG                goroutineLock // used to verify funcs are on serve()
-	pushEnabled           bool
-	sawFirstSettings      bool // got the initial SETTINGS frame after the preface
-	needToSendSettingsAck bool
-	unackedSettings       int    // how many SETTINGS have we sent without ACKs?
-	queuedControlFrames   int    // control frames in the writeSched queue
-	clientMaxStreams      uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
-	advMaxStreams         uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
-	curClientStreams      uint32 // number of open streams initiated by the client
-	curPushedStreams      uint32 // number of open streams initiated by server push
-	curHandlers           uint32 // number of running handler goroutines
-	maxClientStreamID     uint32 // max ever seen from client (odd), or 0 if there have been no client requests
-	maxPushPromiseID      uint32 // ID of the last push promise (even), or 0 if there have been no pushes
-	streams               map[uint32]*stream
-	unstartedHandlers     []unstartedHandler
-	maxFrameSize          int32
-	headerTableSize       uint32
-	peerMaxHeaderListSize uint32            // zero means unknown (default)
-	canonHeader           map[string]string // http2-lower-case -> Go-Canonical-Case
-	canonHeaderKeysSize   int               // canonHeader keys size in bytes
-	writingFrame          bool              // started writing a frame (on serve goroutine or separate)
-	writingFrameAsync     bool              // started a frame on its own goroutine but haven't heard back on wroteFrameCh
-	needsFrameFlush       bool              // last frame write wasn't a flush
-	inGoAway              bool              // we've started to or sent GOAWAY
-	inFrameScheduleLoop   bool              // whether we're in the scheduleFrameWrite loop
-	needToSendGoAway      bool              // we need to schedule a GOAWAY frame write
-	goAwayCode            ErrCode
-	shutdownTimer         *time.Timer // nil until used
-	idleTimer             *time.Timer // nil if unused
+	serveG                  goroutineLock // used to verify funcs are on serve()
+	pushEnabled             bool
+	sawFirstSettings        bool // got the initial SETTINGS frame after the preface
+	needToSendSettingsAck   bool
+	unackedSettings         int    // how many SETTINGS have we sent without ACKs?
+	pendingEncoderTableSize bool   // peer changed SETTINGS_HEADER_TABLE_SIZE; apply to hpackEncoder before the next frame write
+	encoderTableSizeMin     uint32 // smallest SETTINGS_HEADER_TABLE_SIZE since the last apply
+	encoderTableSize        uint32 // latest SETTINGS_HEADER_TABLE_SIZE
+	queuedControlFrames     int    // control frames in the writeSched queue
+	clientMaxStreams        uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
+	advMaxStreams           uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
+	curClientStreams        uint32 // number of open streams initiated by the client
+	curPushedStreams        uint32 // number of open streams initiated by server push
+	curHandlers             uint32 // number of running handler goroutines
+	maxClientStreamID       uint32 // max ever seen from client (odd), or 0 if there have been no client requests
+	maxPushPromiseID        uint32 // ID of the last push promise (even), or 0 if there have been no pushes
+	streams                 map[uint32]*stream
+	unstartedHandlers       []unstartedHandler
+	maxFrameSize            int32
+	headerTableSize         uint32
+	peerMaxHeaderListSize   uint32            // zero means unknown (default)
+	canonHeader             map[string]string // http2-lower-case -> Go-Canonical-Case
+	canonHeaderKeysSize     int               // canonHeader keys size in bytes
+	writingFrame            bool              // started writing a frame (on serve goroutine or separate)
+	writingFrameAsync       bool              // started a frame on its own goroutine but haven't heard back on wroteFrameCh
+	needsFrameFlush         bool              // last frame write wasn't a flush
+	inGoAway                bool              // we've started to or sent GOAWAY
+	inFrameScheduleLoop     bool              // whether we're in the scheduleFrameWrite loop
+	needToSendGoAway        bool              // we need to schedule a GOAWAY frame write
+	goAwayCode              ErrCode
+	shutdownTimer           *time.Timer // nil until used
+	idleTimer               *time.Timer // nil if unused
 
 	// Owned by the writeFrameAsync goroutine:
 	headerWriteBuf bytes.Buffer
@@ -1175,6 +1178,16 @@ func (sc *serverConn) startFrameWrite(wr FrameWriteRequest) {
 
 	sc.writingFrame = true
 	sc.needsFrameFlush = true
+	if sc.pendingEncoderTableSize {
+		// hpackEncoder may be in use by writeFrameAsync, so SETTINGS
+		// changes to it are deferred until no frame is being written.
+		// Replaying the smallest size before the latest one keeps the
+		// encoder's view identical to having applied every change
+		// (RFC 7541, Section 4.2).
+		sc.pendingEncoderTableSize = false
+		sc.hpackEncoder.SetMaxDynamicTableSize(sc.encoderTableSizeMin)
+		sc.hpackEncoder.SetMaxDynamicTableSize(sc.encoderTableSize)
+	}
 	if wr.write.staysWithinBuffer(sc.bw.Available()) {
 		sc.writingFrameAsync = false
 		err := wr.write.writeFrame(sc)
@@ -1609,7 +1622,12 @@ func (sc *serverConn) processSetting(s Setting) error {
 	switch s.ID {
 	case SettingHeaderTableSize:
 		sc.headerTableSize = s.Val
-		sc.hpackEncoder.SetMaxDynamicTableSize(s.Val)
+		// Applied by startFrameWrite; see comment there.
+		if !sc.pendingEncoderTableSize || s.Val < sc.encoderTableSizeMin {
+			sc.encoderTableSizeMin = s.Val
+		}
+		sc.encoderTableSize = s.Val
+		sc.pendingEncoderTableSize = true
 	case SettingEnablePush:
 		sc.pushEnabled = s.Val != 0
 	case SettingMaxConcurrentStreams:

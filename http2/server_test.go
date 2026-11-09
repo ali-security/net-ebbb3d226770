@@ -2909,6 +2909,166 @@ func TestServerWithH2Load(t *testing.T) {
 	}
 }
 
+// writeGate holds the Writes of a gatedListener's conns while held.
+type writeGate struct {
+	mu      sync.Mutex
+	release chan struct{} // non-nil while Writes are held
+	blocked chan struct{} // signaled when a Write starts waiting on release
+}
+
+func newWriteGate() *writeGate {
+	return &writeGate{blocked: make(chan struct{}, 1)}
+}
+
+func (g *writeGate) hold() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.release == nil {
+		g.release = make(chan struct{})
+	}
+}
+
+func (g *writeGate) unhold() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.release != nil {
+		close(g.release)
+		g.release = nil
+	}
+}
+
+func (g *writeGate) wait() {
+	g.mu.Lock()
+	release := g.release
+	g.mu.Unlock()
+	if release == nil {
+		return
+	}
+	select {
+	case g.blocked <- struct{}{}:
+	default:
+	}
+	<-release
+}
+
+type gatedListener struct {
+	net.Listener
+	gate *writeGate
+}
+
+func (l gatedListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return gatedConn{Conn: c, gate: l.gate}, nil
+}
+
+type gatedConn struct {
+	net.Conn
+	gate *writeGate
+}
+
+func (c gatedConn) Write(p []byte) (int, error) {
+	c.gate.wait()
+	return c.Conn.Write(p)
+}
+
+// hpackEncoderMaxDynamicTableSize returns enc's current maximum dynamic
+// table size. hpack.Encoder has no accessor for it, so it is read with
+// reflect.
+func hpackEncoderMaxDynamicTableSize(enc *hpack.Encoder) uint32 {
+	return uint32(reflect.ValueOf(enc).Elem().FieldByName("dynTab").FieldByName("maxSize").Uint())
+}
+
+// TestServer_HeaderTableSizeDuringWrite tests that a
+// SETTINGS_HEADER_TABLE_SIZE change from the client is not applied to the
+// server's HPACK encoder while a frame write, which may be using the encoder
+// on another goroutine, is in progress.
+func TestServer_HeaderTableSizeDuringWrite(t *testing.T) {
+	gate := newWriteGate()
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {}, func(ts *httptest.Server) {
+		ts.Listener = gatedListener{Listener: ts.Listener, gate: gate}
+	})
+	defer st.Close()
+	defer gate.unhold()
+	st.greet()
+
+	// encoderMaxTableSize reports the encoder's maximum dynamic table size
+	// and the last SETTINGS_HEADER_TABLE_SIZE the server processed.
+	encoderMaxTableSize := func() (encSize, settingSize uint32) {
+		ch := make(chan [2]uint32, 1)
+		st.sc.serveMsgCh <- func(int) {
+			ch <- [2]uint32{hpackEncoderMaxDynamicTableSize(st.sc.hpackEncoder), st.sc.headerTableSize}
+		}
+		v := <-ch
+		return v[0], v[1]
+	}
+
+	// Leave the server's write of the stream 1 response in progress while
+	// the client changes SETTINGS_HEADER_TABLE_SIZE twice.
+	gate.hold()
+	st.bodylessReq1()
+	select {
+	case <-gate.blocked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for the server to write the stream 1 response")
+	}
+	if err := st.fr.WriteSettings(Setting{SettingHeaderTableSize, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.fr.WriteSettings(Setting{SettingHeaderTableSize, 2048}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		encSize, settingSize := encoderMaxTableSize()
+		if settingSize == 2048 {
+			// Table size should not be changed immediately. To avoid
+			// concurrent use of the encoder, we apply the size change right
+			// before we use the encoder to write frames.
+			if want := uint32(initialHeaderTableSize); encSize != want {
+				t.Errorf("during frame write: encoder header table size = %d, want %d", encSize, want)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timeout waiting for the server to process SETTINGS")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	gate.unhold()
+	if hf := st.wantHeaders(); hf.StreamID != 1 || !hf.StreamEnded() {
+		t.Fatalf("got HEADERS for stream %d (END_STREAM=%v), want stream 1 with END_STREAM", hf.StreamID, hf.StreamEnded())
+	}
+	st.wantSettingsAck()
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      3,
+		BlockFragment: st.encodeHeader(),
+		EndStream:     true,
+		EndHeaders:    true,
+	})
+	hf := st.wantHeaders()
+	if hf.StreamID != 3 {
+		t.Fatalf("got HEADERS for stream %d, want stream 3", hf.StreamID)
+	}
+	// The response must signal both the smallest (0) and the final (2048)
+	// table size (RFC 7541, Section 4.2), just like an encoder that saw both
+	// size changes directly.
+	var want bytes.Buffer
+	wantEnc := hpack.NewEncoder(&want)
+	wantEnc.SetMaxDynamicTableSize(0)
+	wantEnc.SetMaxDynamicTableSize(2048)
+	wantEnc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	if got := hf.HeaderBlockFragment(); !bytes.HasPrefix(got, want.Bytes()) {
+		t.Errorf("stream 3 header block = %x, want prefix %x", got, want.Bytes())
+	}
+	if got, _ := encoderMaxTableSize(); got != 2048 {
+		t.Errorf("after frame write: encoder header table size = %d, want %d", got, 2048)
+	}
+}
+
 // Issue 12843
 func TestServerDoS_MaxHeaderListSize(t *testing.T) {
 	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {})
